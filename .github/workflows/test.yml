@@ -1,0 +1,36 @@
+name:                  test
+
+on:
+  repository_dispatch:
+    types:
+      - test-command
+
+jobs:
+  test:
+    name:              Test
+    runs-on:           macos-latest
+
+    steps:
+    # checkout the current PR of `ComposableRequest`.
+    - name:            Checkout
+      uses:            actions/checkout@v2
+      with:
+          token:       ${{ secrets.GITHUB_TOKEN }}
+          repository:  ${{ github.event.client_payload.pull_request.head.repo.full_name }}
+          ref:         ${{ github.event.client_payload.pull_request.head.sha }}
+    # filter updates.
+    - uses:            dorny/paths-filter@v2
+      id:              changes
+      with:
+        base:          ${{ github.event.client_payload.pull_request.base.sha }}
+        ref:           ${{ github.event.client_payload.pull_request.head.sha }}
+        filters:       |
+          src:
+            - '**/*.swift'
+    # run all tests.
+    - name:            Test
+      if:              steps.changes.outputs.src == 'true'
+      run:             swift test --parallel --enable-test-discovery
+      env:
+        SECRET:        ${{ secrets.SECRET }}
+        PASSWORD:      ${{ secrets.PASSWORD }}
