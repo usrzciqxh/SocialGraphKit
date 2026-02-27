@@ -1,10 +1,3 @@
-//
-//  AuthenticatorWebView.swift
-//  SocialGraphKit
-//
-//  Created by User on 27/02/26. - updated -
-//
-
 #if canImport(UIKit) && canImport(WebKit)
 
 import Foundation
@@ -12,16 +5,8 @@ import WebKit
 import Combine
 import UIKit
 
-/// Specialized WKWebView used only for authentication.
-/// It emits `Secret` as soon as required cookies become available.
-///
-/// Goals:
-/// - Behave more like a real Safari session (shared process pool, persistent store)
-/// - Extract cookies reliably via observer + lightweight throttling (avoid tight polling)
-/// - Avoid emitting Secret too early (require key cookies)
-/// - Allow continuing the flow on checkpoint / challenge URLs (loadCheckpoint)
 @available(iOS 16.0, macOS 10.13, macCatalyst 13, *)
-public final class AuthenticatorWebView: WKWebView, WKNavigationDelegate, WKHTTPCookieStoreObserver {
+internal final class AuthenticatorWebView: WKWebView, WKNavigationDelegate, WKHTTPCookieStoreObserver {
 
     // MARK: - Properties
 
@@ -42,9 +27,7 @@ public final class AuthenticatorWebView: WKWebView, WKNavigationDelegate, WKHTTP
     }
 
     private let subject: CurrentValueSubject<Secret?, Swift.Error> = .init(nil)
-
-    /// Emits a `Secret` once key cookies are present.
-    public lazy var secret: AnyPublisher<Secret, Swift.Error> = {
+    lazy var secret: AnyPublisher<Secret, Swift.Error> = {
         subject.compactMap { $0 }.eraseToAnyPublisher()
     }()
 
@@ -52,14 +35,11 @@ public final class AuthenticatorWebView: WKWebView, WKNavigationDelegate, WKHTTP
     private var isAttemptInFlight: Bool = false
     private var attemptCount: Int = 0
 
-    // MARK: - Shared “Safari-like” components
-
-    /// Shared process pool makes session feel closer to Safari across WKWebView instances.
     private static let sharedProcessPool = WKProcessPool()
 
     // MARK: - Init
 
-    public required init(client: Client) {
+    required init(client: Client) {
         let configuration = WKWebViewConfiguration()
 
         let prefs = WKWebpagePreferences()
@@ -69,36 +49,16 @@ public final class AuthenticatorWebView: WKWebView, WKNavigationDelegate, WKHTTP
         configuration.websiteDataStore = .default()
         configuration.processPool = Self.sharedProcessPool
 
-        // Keep this minimal – removing too much DOM can trigger different flows.
-        configuration.userContentController.addUserScript(
-            .init(
-                source: """
-                try {
-                  const banner = document.querySelector('[role="dialog"]');
-                  // do nothing aggressive; keep UI stable
-                } catch (_) {}
-                """,
-                injectionTime: .atDocumentEnd,
-                forMainFrameOnly: true
-            )
-        )
-
         self.client = client
         super.init(frame: .zero, configuration: configuration)
 
-        // Safari-like UA (web UA). Keep stable.
         self.customUserAgent = Self.mobileSafariUserAgent()
-
         self.navigationDelegate = self
-
-        // Observe cookie updates (best signal for login completion)
         self.configuration.websiteDataStore.httpCookieStore.add(self)
     }
 
     @available(*, unavailable)
-    public required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     deinit {
         configuration.websiteDataStore.httpCookieStore.remove(self)
@@ -106,45 +66,61 @@ public final class AuthenticatorWebView: WKWebView, WKNavigationDelegate, WKHTTP
 
     // MARK: - Public
 
-    public func loadLogin() {
+    func loadLogin() {
         guard let url = URL(string: "https://www.instagram.com/accounts/login/") else { return }
-        loadWebLike(url: url)
+        var request = URLRequest(url: url)
+        request.cachePolicy = .useProtocolCachePolicy
+        request.timeoutInterval = 60
+        request.setValue("tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7", forHTTPHeaderField: "Accept-Language")
+        request.setValue("1", forHTTPHeaderField: "DNT")
+        load(request)
     }
 
-    /// Continue authentication on a checkpoint / challenge URL inside the same WebView.
-    public func loadCheckpoint(_ url: URL) {
-        loadWebLike(url: url)
+    /// Checkpoint URL’i (varsa) aynı web session içinde açmak için.
+    /// Not: i.instagram.com/web/unsupported_version dönerse bu sayfa çözüm değil — kullanıcıyı www.instagram.com'a yönlendireceğiz (SGManager tarafında).
+    func loadCheckpoint(_ url: URL) {
+        var request = URLRequest(url: url)
+        request.cachePolicy = .useProtocolCachePolicy
+        request.timeoutInterval = 60
+        load(request)
     }
 
-    /// Optional hard reset – call manually only when you truly want to clear everything.
-    public func resetSession() {
+    func resetSession() {
         Self.clearWebsiteData()
     }
 
     // MARK: - WKNavigationDelegate
 
-    public func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         attemptSecretExtraction(throttleSeconds: 0.6)
     }
 
-    public func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
         attemptSecretExtraction(throttleSeconds: 0.6)
     }
 
-    public func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         guard isAuthenticating else { return }
 
-        // If Instagram throws user to unsupported/challenge pages, do NOT try to "force emit" Secret.
-        if let urlString = webView.url?.absoluteString {
-            if urlString.contains("i.instagram.com/web/unsupported_version")
-                || urlString.contains("/challenge/")
-                || urlString.contains("checkpoint") {
-                return
-            }
+        let urlString = webView.url?.absoluteString ?? ""
+
+        // 1) Onetap "Bilgileri kaydet" ekranı -> otomatik "Şimdi değil / Not now"
+        if urlString.contains("/accounts/onetap/") {
+            webView.evaluateJavaScript("""
+                try {
+                  const btns = Array.from(document.querySelectorAll('button'));
+                  const pick = (t) => (t || '').trim().toLowerCase();
+                  const target = btns.find(b => {
+                    const t = pick(b.innerText);
+                    return t === 'şimdi değil' || t === 'not now' || t === 'not now.' || t.includes('şimdi değil') || t.includes('not now');
+                  });
+                  if (target) target.click();
+                } catch (_) {}
+            """) { _, _ in }
         }
 
-        // Best-effort cookie consent click (conservative).
-        if webView.url?.absoluteString.contains("/accounts/login") ?? false {
+        // 2) Login ekranındaysa cookie consent vb. çok agresif olmayan best-effort
+        if urlString.contains("/accounts/login") {
             webView.evaluateJavaScript("""
                 try {
                   const buttons = Array.from(document.querySelectorAll('button'));
@@ -154,41 +130,28 @@ public final class AuthenticatorWebView: WKWebView, WKNavigationDelegate, WKHTTP
             """) { _, _ in }
         }
 
+        // Cookie hazırsa Secret üret (en doğru sinyal)
         attemptSecretExtraction(throttleSeconds: 0.0)
     }
 
-    public func webView(_ webView: WKWebView,
-                        decidePolicyFor navigationAction: WKNavigationAction,
-                        decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+    func webView(_ webView: WKWebView,
+                 decidePolicyFor navigationAction: WKNavigationAction,
+                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         attemptSecretExtraction(throttleSeconds: 0.6)
         decisionHandler(.allow)
     }
 
-    public func webView(_ webView: WKWebView,
-                        decidePolicyFor navigationResponse: WKNavigationResponse,
-                        decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+    func webView(_ webView: WKWebView,
+                 decidePolicyFor navigationResponse: WKNavigationResponse,
+                 decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
         attemptSecretExtraction(throttleSeconds: 0.6)
         decisionHandler(.allow)
     }
 
     // MARK: - WKHTTPCookieStoreObserver
 
-    public func cookiesDidChange(in cookieStore: WKHTTPCookieStore) {
+    func cookiesDidChange(in cookieStore: WKHTTPCookieStore) {
         attemptSecretExtraction(throttleSeconds: 0.0)
-    }
-
-    // MARK: - Private (Web-like loading)
-
-    private func loadWebLike(url: URL) {
-        var request = URLRequest(url: url)
-        request.cachePolicy = .useProtocolCachePolicy
-        request.timeoutInterval = 60
-        request.setValue("tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7", forHTTPHeaderField: "Accept-Language")
-        request.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", forHTTPHeaderField: "Accept")
-        request.setValue("no-cache", forHTTPHeaderField: "Pragma")
-        request.setValue("max-age=0", forHTTPHeaderField: "Cache-Control")
-        request.setValue("1", forHTTPHeaderField: "DNT")
-        load(request)
     }
 
     // MARK: - Secret Extraction
@@ -198,9 +161,7 @@ public final class AuthenticatorWebView: WKWebView, WKNavigationDelegate, WKHTTP
         guard !isAttemptInFlight else { return }
 
         let now = Date().timeIntervalSince1970
-        if throttleSeconds > 0, (now - lastAttemptAt) < throttleSeconds {
-            return
-        }
+        if throttleSeconds > 0, (now - lastAttemptAt) < throttleSeconds { return }
         lastAttemptAt = now
 
         attemptCount += 1
@@ -210,7 +171,6 @@ public final class AuthenticatorWebView: WKWebView, WKNavigationDelegate, WKHTTP
         configuration.websiteDataStore.httpCookieStore.getAllCookies { [weak self] allCookies in
             guard let self else { return }
             defer { self.isAttemptInFlight = false }
-
             guard self.isAuthenticating else { return }
 
             let cookies = allCookies.filter {
@@ -257,7 +217,6 @@ private extension AuthenticatorWebView {
         let osForCPU = systemVersion.replacingOccurrences(of: ".", with: "_")
         let major = systemVersion.split(separator: ".").first.map(String.init) ?? "16"
         let safariVersion = "\(major).0"
-
         return "Mozilla/5.0 (iPhone; CPU iPhone OS \(osForCPU) like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/\(safariVersion) Mobile/15E148 Safari/604.1"
     }
 }
