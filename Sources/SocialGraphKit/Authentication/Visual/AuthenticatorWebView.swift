@@ -2,7 +2,7 @@
 //  AuthenticatorWebView.swift
 //  SocialGraphKit
 //
-//  Created by User on 27/02/26. - new
+//  Created by User on 27/02/26. - new -- - -
 //
 
 #if canImport(UIKit) && canImport(WebKit)
@@ -114,7 +114,8 @@ internal final class AuthenticatorWebView: WKWebView, WKNavigationDelegate, WKHT
     }
 
     deinit {
-        configuration.websiteDataStore.httpCookieStore.removeObserver(self)
+        // ✅ Xcode/SDK rename: removeObserver(_:) -> remove(_:)
+        configuration.websiteDataStore.httpCookieStore.remove(self)
     }
 
     // MARK: - Public helpers
