@@ -2,7 +2,7 @@
 //  AuthenticatorWebView.swift
 //  SocialGraphKit
 //
-//  Created by User on 27/02/26. - updated
+//  Created by User on 27/02/26. - updated -
 //
 
 #if canImport(UIKit) && canImport(WebKit)
@@ -21,7 +21,7 @@ import UIKit
 /// - Avoid emitting Secret too early (require key cookies)
 /// - Allow continuing the flow on checkpoint / challenge URLs (loadCheckpoint)
 @available(iOS 16.0, macOS 10.13, macCatalyst 13, *)
-internal final class AuthenticatorWebView: WKWebView, WKNavigationDelegate, WKHTTPCookieStoreObserver {
+public final class AuthenticatorWebView: WKWebView, WKNavigationDelegate, WKHTTPCookieStoreObserver {
 
     // MARK: - Properties
 
@@ -42,7 +42,9 @@ internal final class AuthenticatorWebView: WKWebView, WKNavigationDelegate, WKHT
     }
 
     private let subject: CurrentValueSubject<Secret?, Swift.Error> = .init(nil)
-    lazy var secret: AnyPublisher<Secret, Swift.Error> = {
+
+    /// Emits a `Secret` once key cookies are present.
+    public lazy var secret: AnyPublisher<Secret, Swift.Error> = {
         subject.compactMap { $0 }.eraseToAnyPublisher()
     }()
 
@@ -57,7 +59,7 @@ internal final class AuthenticatorWebView: WKWebView, WKNavigationDelegate, WKHT
 
     // MARK: - Init
 
-    required init(client: Client) {
+    public required init(client: Client) {
         let configuration = WKWebViewConfiguration()
 
         let prefs = WKWebpagePreferences()
@@ -94,7 +96,7 @@ internal final class AuthenticatorWebView: WKWebView, WKNavigationDelegate, WKHT
     }
 
     @available(*, unavailable)
-    required init?(coder: NSCoder) {
+    public required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
 
@@ -104,38 +106,35 @@ internal final class AuthenticatorWebView: WKWebView, WKNavigationDelegate, WKHT
 
     // MARK: - Public
 
-    func loadLogin() {
+    public func loadLogin() {
         guard let url = URL(string: "https://www.instagram.com/accounts/login/") else { return }
         loadWebLike(url: url)
     }
 
-    /// ✅ Continue authentication on a checkpoint / challenge URL inside the same WebView.
-    /// Call this when API returns something like:
-    /// https://i.instagram.com/web/unsupported_version/  OR a /challenge/ or /checkpoint/ url.
-    func loadCheckpoint(_ url: URL) {
+    /// Continue authentication on a checkpoint / challenge URL inside the same WebView.
+    public func loadCheckpoint(_ url: URL) {
         loadWebLike(url: url)
     }
 
     /// Optional hard reset – call manually only when you truly want to clear everything.
-    func resetSession() {
+    public func resetSession() {
         Self.clearWebsiteData()
     }
 
     // MARK: - WKNavigationDelegate
 
-    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+    public func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         attemptSecretExtraction(throttleSeconds: 0.6)
     }
 
-    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+    public func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
         attemptSecretExtraction(throttleSeconds: 0.6)
     }
 
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+    public func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         guard isAuthenticating else { return }
 
         // If Instagram throws user to unsupported/challenge pages, do NOT try to "force emit" Secret.
-        // Let the user complete the challenge; cookies may change later.
         if let urlString = webView.url?.absoluteString {
             if urlString.contains("i.instagram.com/web/unsupported_version")
                 || urlString.contains("/challenge/")
@@ -144,7 +143,7 @@ internal final class AuthenticatorWebView: WKWebView, WKNavigationDelegate, WKHT
             }
         }
 
-        // Best-effort cookie consent click (keep conservative; selectors change a lot).
+        // Best-effort cookie consent click (conservative).
         if webView.url?.absoluteString.contains("/accounts/login") ?? false {
             webView.evaluateJavaScript("""
                 try {
@@ -158,23 +157,23 @@ internal final class AuthenticatorWebView: WKWebView, WKNavigationDelegate, WKHT
         attemptSecretExtraction(throttleSeconds: 0.0)
     }
 
-    func webView(_ webView: WKWebView,
-                 decidePolicyFor navigationAction: WKNavigationAction,
-                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+    public func webView(_ webView: WKWebView,
+                        decidePolicyFor navigationAction: WKNavigationAction,
+                        decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         attemptSecretExtraction(throttleSeconds: 0.6)
         decisionHandler(.allow)
     }
 
-    func webView(_ webView: WKWebView,
-                 decidePolicyFor navigationResponse: WKNavigationResponse,
-                 decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+    public func webView(_ webView: WKWebView,
+                        decidePolicyFor navigationResponse: WKNavigationResponse,
+                        decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
         attemptSecretExtraction(throttleSeconds: 0.6)
         decisionHandler(.allow)
     }
 
     // MARK: - WKHTTPCookieStoreObserver
 
-    func cookiesDidChange(in cookieStore: WKHTTPCookieStore) {
+    public func cookiesDidChange(in cookieStore: WKHTTPCookieStore) {
         attemptSecretExtraction(throttleSeconds: 0.0)
     }
 
@@ -184,14 +183,11 @@ internal final class AuthenticatorWebView: WKWebView, WKNavigationDelegate, WKHT
         var request = URLRequest(url: url)
         request.cachePolicy = .useProtocolCachePolicy
         request.timeoutInterval = 60
-
-        // "Webby" headers (WKWebView may ignore some, still harmless + helps initial hop)
         request.setValue("tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7", forHTTPHeaderField: "Accept-Language")
         request.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", forHTTPHeaderField: "Accept")
         request.setValue("no-cache", forHTTPHeaderField: "Pragma")
         request.setValue("max-age=0", forHTTPHeaderField: "Cache-Control")
         request.setValue("1", forHTTPHeaderField: "DNT")
-
         load(request)
     }
 
@@ -207,7 +203,6 @@ internal final class AuthenticatorWebView: WKWebView, WKNavigationDelegate, WKHT
         }
         lastAttemptAt = now
 
-        // Avoid infinite churn if Instagram is not giving required cookies.
         attemptCount += 1
         if attemptCount > 200 { return }
 
@@ -222,15 +217,12 @@ internal final class AuthenticatorWebView: WKWebView, WKNavigationDelegate, WKHT
                 $0.domain.contains(".instagram.com") || $0.domain.contains("instagram.com")
             }
 
-            // Require key cookies before emitting Secret.
             let names = Set(cookies.map(\.name))
             let hasSession = names.contains("sessionid")
             let hasCsrf = names.contains("csrftoken")
             let hasUserId = names.contains("ds_user_id")
 
-            guard hasSession, hasCsrf, hasUserId else {
-                return
-            }
+            guard hasSession, hasCsrf, hasUserId else { return }
 
             if let built = Secret(cookies: cookies, client: self.client) {
                 self.subject.send(built)
