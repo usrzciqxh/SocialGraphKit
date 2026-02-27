@@ -2,7 +2,7 @@
 //  AuthenticatorWebView.swift
 //  SocialGraphKit
 //
-//  Created by User on 27/02/26.
+//  Created by User on 27/02/26. --
 //
 
 #if canImport(UIKit) && canImport(WebKit)
@@ -13,7 +13,7 @@ import Combine
 import UIKit
 
 /// Specialized WKWebView used only for authentication.
-/// It emits `Secret` only when session cookies are truly ready (sessionid + ds_user_id + csrftoken).
+/// It emits `Secret` as soon as required cookies become available.
 @available(iOS 16.0, macOS 10.13, macCatalyst 13, *)
 internal final class AuthenticatorWebView: WKWebView, WKNavigationDelegate {
 
@@ -36,37 +36,25 @@ internal final class AuthenticatorWebView: WKWebView, WKNavigationDelegate {
         }
     }
 
-    private let semaphore: DispatchSemaphore = .init(value: 1)
     private let subject: CurrentValueSubject<Secret?, Swift.Error> = .init(nil)
 
     lazy var secret: AnyPublisher<Secret, Swift.Error> = {
         subject.compactMap { $0 }.eraseToAnyPublisher()
     }()
 
-    private var pollTimer: Timer?
+    private var cookiesObserver: NSObjectProtocol?
     private var lastAttemptAt: TimeInterval = 0
 
-    // MARK: - Config knobs (keep web-like)
+    // MARK: - Shared WebKit Resources (Safari-like consistency)
 
-    /// Keep it "Safari-like": do NOT wipe cookies/storage on each init.
-    private static let shouldClearWebsiteDataOnInit: Bool = false
-
-    /// WKProcessPool should be shared to avoid "new browser instance" fingerprint on every init.
     private static let sharedProcessPool = WKProcessPool()
-
-    /// Polling is useful for challenge screens, but too aggressive polling can look suspicious.
-    private static let pollInterval: TimeInterval = 1.25
-
-    /// Some setups benefit from forcing a Safari-like UA, some do not.
-    /// Default: use WKWebView’s own UA (most web-like on iOS).
-    private static let shouldOverrideUserAgent: Bool = false
-
-    /// We only emit secret when these cookies exist.
-    private static let requiredCookieNames: Set<String> = ["sessionid", "ds_user_id", "csrftoken"]
 
     // MARK: - Init
 
-    required init(client: Client) {
+    /// - Parameters:
+    ///   - client: SocialGraphKit client instance used to build Secret.
+    ///   - clearInstagramCookiesOnStart: If true, clears instagram.com cookies before auth begins.
+    required init(client: Client, clearInstagramCookiesOnStart: Bool = false) {
         let configuration = WKWebViewConfiguration()
 
         let prefs = WKWebpagePreferences()
@@ -94,17 +82,19 @@ internal final class AuthenticatorWebView: WKWebView, WKNavigationDelegate {
         self.client = client
         super.init(frame: .zero, configuration: configuration)
 
-        if Self.shouldOverrideUserAgent {
-            self.customUserAgent = Self.mobileSafariUserAgent()
-        }
+        // Safari-like UA helps avoid "unsupported browser" pages.
+        // WKWebView already uses Safari-like UA, but keeping a stable one helps.
+        self.customUserAgent = Self.mobileSafariUserAgent()
 
         self.navigationDelegate = self
 
-        if Self.shouldClearWebsiteDataOnInit {
-            Self.clearWebsiteData()
+        // Optional: clear only instagram cookies (not the whole website data store).
+        if clearInstagramCookiesOnStart {
+            Self.clearInstagramCookies(in: configuration.websiteDataStore.httpCookieStore)
         }
 
-        startPolling()
+        // Observe cookie changes instead of polling.
+        startObservingCookies()
     }
 
     @available(*, unavailable)
@@ -113,17 +103,17 @@ internal final class AuthenticatorWebView: WKWebView, WKNavigationDelegate {
     }
 
     deinit {
-        stopPolling()
+        stopObservingCookies()
     }
 
     // MARK: - WKNavigationDelegate
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
-        attemptSecretExtraction(throttleSeconds: 0.35)
+        attemptSecretExtraction(throttleSeconds: 0.25)
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
-        attemptSecretExtraction(throttleSeconds: 0.35)
+        attemptSecretExtraction(throttleSeconds: 0.25)
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -143,36 +133,44 @@ internal final class AuthenticatorWebView: WKWebView, WKNavigationDelegate {
     func webView(_ webView: WKWebView,
                  decidePolicyFor navigationAction: WKNavigationAction,
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-        attemptSecretExtraction(throttleSeconds: 0.35)
+        attemptSecretExtraction(throttleSeconds: 0.25)
         decisionHandler(.allow)
     }
 
     func webView(_ webView: WKWebView,
                  decidePolicyFor navigationResponse: WKNavigationResponse,
                  decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
-        attemptSecretExtraction(throttleSeconds: 0.35)
+        attemptSecretExtraction(throttleSeconds: 0.25)
         decisionHandler(.allow)
     }
 
-    // MARK: - Polling
+    // MARK: - Cookie Observing (Instead of polling)
 
-    private func startPolling() {
-        stopPolling()
-        pollTimer = Timer.scheduledTimer(withTimeInterval: Self.pollInterval, repeats: true) { [weak self] _ in
+    private func startObservingCookies() {
+        stopObservingCookies()
+
+        // We can't add a WKHTTPCookieStore observer directly without adopting protocol,
+        // so we observe periodically via notifications pattern here:
+        // - Attempt extraction on common runloop turns (navigation callbacks + this observer)
+        cookiesObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
             self?.attemptSecretExtraction(throttleSeconds: 0.0)
-        }
-        if let pollTimer {
-            RunLoop.main.add(pollTimer, forMode: .common)
         }
     }
 
-    private func stopPolling() {
-        pollTimer?.invalidate()
-        pollTimer = nil
+    private func stopObservingCookies() {
+        if let token = cookiesObserver {
+            NotificationCenter.default.removeObserver(token)
+            cookiesObserver = nil
+        }
     }
 
     // MARK: - Secret Extraction
 
+    /// Tries to build `Secret` from cookies. If it succeeds, completes publisher and stops UI.
     private func attemptSecretExtraction(throttleSeconds: TimeInterval) {
         guard isAuthenticating else { return }
 
@@ -182,47 +180,29 @@ internal final class AuthenticatorWebView: WKWebView, WKNavigationDelegate {
         }
         lastAttemptAt = now
 
-        DispatchQueue.global(qos: .userInitiated).async { [self] in
-            self.semaphore.wait()
-            guard self.isAuthenticating else { self.semaphore.signal(); return }
+        configuration.websiteDataStore.httpCookieStore.getAllCookies { [weak self] allCookies in
+            guard let self else { return }
+            guard self.isAuthenticating else { return }
 
-            DispatchQueue.main.async { [self] in
-                let cookieStore = self.configuration.websiteDataStore.httpCookieStore
-                cookieStore.getAllCookies { [self] allCookies in
+            // Keep only relevant cookies.
+            let cookies = allCookies.filter { cookie in
+                cookie.domain.contains(".instagram.com") || cookie.domain.contains("instagram.com")
+            }
 
-                    // Keep only relevant cookies.
-                    let igCookies = allCookies.filter { cookie in
-                        cookie.domain.contains(".instagram.com")
-                        || cookie.domain.contains("instagram.com")
-                    }
+            // Extra safety: require the core session cookies before trying Secret().
+            let names = Set(cookies.map { $0.name.lowercased() })
+            let hasSession = names.contains("sessionid")
+            let hasUserId  = names.contains("ds_user_id")
+            let hasCsrf    = names.contains("csrftoken")
 
-                    // Gate: ensure session cookies exist (prevents early/unstable secret).
-                    if !Self.hasRequiredCookies(in: igCookies) {
-                        self.semaphore.signal()
-                        return
-                    }
+            guard hasSession, hasUserId, hasCsrf else {
+                return
+            }
 
-                    // Optional extra gate: we prefer not to emit while still on /accounts/login
-                    // because session may not be fully settled yet.
-                    if let url = self.url?.absoluteString,
-                       url.contains("/accounts/login") {
-                        self.semaphore.signal()
-                        return
-                    }
-
-                    if let secret = Secret(cookies: igCookies, client: self.client) {
-                        self.subject.send(secret)
-                        self.subject.send(completion: .finished)
-
-                        self.isAuthenticating = false
-                        self.stopPolling()
-
-                        self.semaphore.signal()
-                        return
-                    }
-
-                    self.semaphore.signal()
-                }
+            if let secret = Secret(cookies: cookies, client: self.client) {
+                self.subject.send(secret)
+                self.subject.send(completion: .finished)
+                self.isAuthenticating = false
             }
         }
     }
@@ -233,27 +213,13 @@ internal final class AuthenticatorWebView: WKWebView, WKNavigationDelegate {
 @available(iOS 16.0, macOS 10.13, macCatalyst 13, *)
 private extension AuthenticatorWebView {
 
-    static func hasRequiredCookies(in cookies: [HTTPCookie]) -> Bool {
-        let names = Set(cookies.map { $0.name.lowercased() })
-        for req in requiredCookieNames {
-            if !names.contains(req) { return false }
+    static func clearInstagramCookies(in store: WKHTTPCookieStore) {
+        store.getAllCookies { cookies in
+            let targets = cookies.filter { c in
+                c.domain.contains(".instagram.com") || c.domain.contains("instagram.com")
+            }
+            targets.forEach { store.delete($0) }
         }
-        return true
-    }
-
-    static func clearWebsiteData() {
-        let dataStore = WKWebsiteDataStore.default()
-        let types: Set<String> = [
-            WKWebsiteDataTypeCookies,
-            WKWebsiteDataTypeLocalStorage,
-            WKWebsiteDataTypeSessionStorage,
-            WKWebsiteDataTypeIndexedDBDatabases,
-            WKWebsiteDataTypeWebSQLDatabases,
-            WKWebsiteDataTypeDiskCache,
-            WKWebsiteDataTypeMemoryCache
-        ]
-
-        dataStore.removeData(ofTypes: types, modifiedSince: Date(timeIntervalSince1970: 0)) { }
     }
 
     static func mobileSafariUserAgent() -> String {
