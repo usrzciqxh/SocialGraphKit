@@ -1,3 +1,10 @@
+//
+//  AuthenticatorWebView.swift
+//  SocialGraphKit
+//
+//  Created by User on 27/02/26. - new
+//
+
 #if canImport(UIKit) && canImport(WebKit)
 
 import Foundation
@@ -6,35 +13,26 @@ import Combine
 import UIKit
 
 /// Specialized WKWebView used only for authentication.
-/// It emits `Secret` only after a *validated* logged-in state.
-/// If Instagram shows checkpoint/unsupported pages, it keeps the WebView alive
-/// and waits for the user to complete the flow in the same session.
+/// It emits `Secret` as soon as required cookies become available.
+///
+/// Goals:
+/// - Behave more like a real Safari session (persisted process pool, avoid aggressive clearing/polling)
+/// - Extract cookies reliably with observer (less "bot-like" than tight polling)
+/// - Keep existing public surface area (publisher-based Secret emission)
 @available(iOS 16.0, macOS 10.13, macCatalyst 13, *)
-internal final class AuthenticatorWebView: WKWebView, WKNavigationDelegate {
-
-    // MARK: - Phase
-
-    private enum Phase {
-        case authenticating   // user is logging in / challenge screens
-        case validating       // we have candidate cookies; now validating by navigating to a logged-in page
-        case finished         // secret emitted
-    }
+internal final class AuthenticatorWebView: WKWebView, WKNavigationDelegate, WKHTTPCookieStoreObserver {
 
     // MARK: - Properties
 
     private let client: Client
 
-    /// More stable sessions by reusing same process pool (browser-like).
-    private static let sharedProcessPool = WKProcessPool()
-
-    private var phase: Phase = .authenticating {
+    private var isAuthenticating: Bool = true {
         didSet {
-            switch phase {
-            case .authenticating, .validating:
+            if isAuthenticating {
                 navigationDelegate = self
                 isUserInteractionEnabled = true
                 isHidden = false
-            case .finished:
+            } else {
                 navigationDelegate = nil
                 isUserInteractionEnabled = false
                 isHidden = true
@@ -45,65 +43,69 @@ internal final class AuthenticatorWebView: WKWebView, WKNavigationDelegate {
     private let semaphore: DispatchSemaphore = .init(value: 1)
     private let subject: CurrentValueSubject<Secret?, Swift.Error> = .init(nil)
 
-    internal lazy var secret: AnyPublisher<Secret, Swift.Error> = {
+    lazy var secret: AnyPublisher<Secret, Swift.Error> = {
         subject.compactMap { $0 }.eraseToAnyPublisher()
     }()
 
-    private var pollTimer: Timer?
     private var lastAttemptAt: TimeInterval = 0
 
-    /// Candidate secret (cookies exist) but not validated yet.
-    private var pendingSecret: Secret?
+    // MARK: - Shared “Safari-like” components
 
-    /// Prevent infinite validate loops.
-    private var validationAttempts: Int = 0
-    private let maxValidationAttempts: Int = 6
-
-    /// If true, clears cookies/storage on init. Default false (more “real browser”).
-    private let shouldClearWebsiteDataOnStart: Bool
+    /// Using a shared process pool makes the web session behave closer to Safari
+    /// (cookies/storage continuity across WKWebView instances within the app process).
+    private static let sharedProcessPool = WKProcessPool()
 
     // MARK: - Init
 
-    required init(client: Client, shouldClearWebsiteDataOnStart: Bool = false) {
-        self.client = client
-        self.shouldClearWebsiteDataOnStart = shouldClearWebsiteDataOnStart
-
+    required init(client: Client) {
         let configuration = WKWebViewConfiguration()
 
         let prefs = WKWebpagePreferences()
         prefs.preferredContentMode = .mobile
         configuration.defaultWebpagePreferences = prefs
 
+        // Persistent store (Safari-like)
         configuration.websiteDataStore = .default()
+
+        // IMPORTANT: shared process pool (Safari-like)
         configuration.processPool = Self.sharedProcessPool
 
+        // Keep JS enabled (default), but explicit is fine.
+        configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
+
+        // Lightweight UI cleanup (best-effort; should not affect auth flow)
         configuration.userContentController.addUserScript(
             .init(
                 source: """
-                // Best-effort UI cleanup.
-                const cookieBar = document.getElementsByClassName('lOPC8 DPEif')?.[0];
-                if (cookieBar) cookieBar.remove();
+                try {
+                  const cookieBar = document.getElementsByClassName('lOPC8 DPEif')?.[0];
+                  if (cookieBar) cookieBar.remove();
 
-                const headerNotice = document.getElementById('header-notices');
-                if (headerNotice) headerNotice.remove();
+                  const headerNotice = document.getElementById('header-notices');
+                  if (headerNotice) headerNotice.remove();
+                } catch (_) {}
                 """,
                 injectionTime: .atDocumentEnd,
                 forMainFrameOnly: true
             )
         )
 
+        self.client = client
         super.init(frame: .zero, configuration: configuration)
 
-        // Safari-like UA: helps reduce "unsupported browser/version" pages.
+        // More Safari-like UA (avoid "unsupported browser" pages).
+        // NOTE: This is still "web" UA (Safari). That’s intentional for WebView login.
         self.customUserAgent = Self.mobileSafariUserAgent()
+
         self.navigationDelegate = self
 
-        // Clearing on every init can increase checkpoint frequency.
-        if shouldClearWebsiteDataOnStart {
-            Self.clearWebsiteData()
-        }
+        // Observe cookie updates instead of aggressive polling.
+        self.configuration.websiteDataStore.httpCookieStore.add(self)
 
-        startPolling()
+        // Don’t clear website data on every init.
+        // Clearing at every init can look suspicious and also breaks continuity.
+        //
+        // If you really need a "hard reset", call `resetSession()` from outside explicitly.
     }
 
     @available(*, unavailable)
@@ -111,31 +113,58 @@ internal final class AuthenticatorWebView: WKWebView, WKNavigationDelegate {
         fatalError("init(coder:) has not been implemented")
     }
 
-    deinit { stopPolling() }
+    deinit {
+        configuration.websiteDataStore.httpCookieStore.removeObserver(self)
+    }
+
+    // MARK: - Public helpers
+
+    /// Load Instagram login in a slightly more "real browser" way (request headers).
+    /// Call this from your VC after creating the view.
+    func loadLogin() {
+        guard let url = URL(string: "https://www.instagram.com/accounts/login/") else { return }
+        var request = URLRequest(url: url)
+        request.cachePolicy = .useProtocolCachePolicy
+        request.timeoutInterval = 60
+
+        // These headers are "webby" and harmless; WKWebView may ignore some,
+        // but sending them on initial request helps mimic normal navigation.
+        request.setValue("tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7", forHTTPHeaderField: "Accept-Language")
+        request.setValue("1", forHTTPHeaderField: "DNT")
+        request.setValue("max-age=0", forHTTPHeaderField: "Cache-Control")
+        request.setValue("no-cache", forHTTPHeaderField: "Pragma")
+
+        load(request)
+    }
+
+    /// If you want a hard reset (manual).
+    func resetSession() {
+        Self.clearWebsiteData()
+    }
 
     // MARK: - WKNavigationDelegate
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
-        attemptSecretExtraction(throttleSeconds: 0.25)
+        attemptSecretExtraction(throttleSeconds: 0.5)
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
-        attemptSecretExtraction(throttleSeconds: 0.25)
+        attemptSecretExtraction(throttleSeconds: 0.5)
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard isAuthenticating else { return }
 
-        // Best-effort: auto accept cookies on login screen.
-        if isLoginPage(url: webView.url) {
+        // Best-effort cookie consent click (may change over time; safe to ignore errors).
+        if webView.url?.absoluteString.contains("/accounts/login") ?? false {
             webView.evaluateJavaScript("""
-                const btn = document.getElementsByClassName("aOOlW  bIiDR  ")?.[0];
-                if (btn) btn.click();
+                try {
+                  const btn =
+                    document.querySelector('button:has(div:contains("Allow all cookies"))') ||
+                    document.getElementsByClassName("aOOlW  bIiDR  ")?.[0];
+                  if (btn) btn.click();
+                } catch (_) {}
             """) { _, _ in }
-        }
-
-        // If we were validating, decide success/fail based on final URL.
-        if phase == .validating {
-            handleValidationFinish(currentURL: webView.url)
         }
 
         attemptSecretExtraction(throttleSeconds: 0.0)
@@ -144,157 +173,70 @@ internal final class AuthenticatorWebView: WKWebView, WKNavigationDelegate {
     func webView(_ webView: WKWebView,
                  decidePolicyFor navigationAction: WKNavigationAction,
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-        attemptSecretExtraction(throttleSeconds: 0.25)
+        attemptSecretExtraction(throttleSeconds: 0.5)
         decisionHandler(.allow)
     }
 
     func webView(_ webView: WKWebView,
                  decidePolicyFor navigationResponse: WKNavigationResponse,
                  decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
-        attemptSecretExtraction(throttleSeconds: 0.25)
+        attemptSecretExtraction(throttleSeconds: 0.5)
         decisionHandler(.allow)
     }
 
-    // MARK: - Polling
+    // MARK: - WKHTTPCookieStoreObserver
 
-    private func startPolling() {
-        stopPolling()
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.75, repeats: true) { [weak self] _ in
-            self?.attemptSecretExtraction(throttleSeconds: 0.0)
-        }
-        if let pollTimer {
-            RunLoop.main.add(pollTimer, forMode: .common)
-        }
+    func cookiesDidChange(in cookieStore: WKHTTPCookieStore) {
+        // Cookie changes are the most reliable signal that login completed.
+        attemptSecretExtraction(throttleSeconds: 0.0)
     }
 
-    private func stopPolling() {
-        pollTimer?.invalidate()
-        pollTimer = nil
-    }
+    // MARK: - Secret Extraction
 
-    // MARK: - Core Logic
-
-    /// 1) Collect cookies -> build Secret (candidate)
-    /// 2) DO NOT emit immediately
-    /// 3) Validate by navigating to an authenticated page (/accounts/edit/)
-    /// 4) If checkpoint/unsupported -> keep WebView, wait user
+    /// Tries to build `Secret` from cookies. If it succeeds, completes publisher and stops UI.
     private func attemptSecretExtraction(throttleSeconds: TimeInterval) {
-        guard phase != .finished else { return }
+        guard isAuthenticating else { return }
 
         let now = Date().timeIntervalSince1970
-        if throttleSeconds > 0, (now - lastAttemptAt) < throttleSeconds { return }
-        lastAttemptAt = now
-
-        // If currently on checkpoint/unsupported screens, do not emit or validate.
-        if isCheckpointOrUnsupportedPage(url: self.url) {
-            phase = .authenticating
-            pendingSecret = nil
-            validationAttempts = 0
+        if throttleSeconds > 0, (now - lastAttemptAt) < throttleSeconds {
             return
         }
+        lastAttemptAt = now
 
         DispatchQueue.global(qos: .userInitiated).async { [self] in
-            self.semaphore.wait()
-            defer { self.semaphore.signal() }
+            semaphore.wait()
+            defer { semaphore.signal() }
 
-            if self.phase == .finished { return }
+            guard isAuthenticating else { return }
 
             DispatchQueue.main.async { [self] in
-                self.configuration.websiteDataStore.httpCookieStore.getAllCookies { [self] allCookies in
+                configuration.websiteDataStore.httpCookieStore.getAllCookies { [self] allCookies in
 
                     let cookies = allCookies.filter { cookie in
                         cookie.domain.contains(".instagram.com") || cookie.domain.contains("instagram.com")
                     }
 
-                    guard let candidate = Secret(cookies: cookies, client: self.client) else {
+                    // Minimal sanity check: wait for key cookies we expect after successful web login.
+                    // (This prevents emitting a Secret too early.)
+                    let names = Set(cookies.map(\.name))
+                    let hasSession = names.contains("sessionid")
+                    let hasCsrf = names.contains("csrftoken")
+                    let hasUserId = names.contains("ds_user_id")
+
+                    guard hasSession, hasCsrf, hasUserId else {
                         return
                     }
 
-                    // If already validating, just keep the pending secret.
-                    self.pendingSecret = candidate
+                    if let built = Secret(cookies: cookies, client: self.client) {
+                        subject.send(built)
+                        subject.send(completion: .finished)
 
-                    // Start validation if not started yet.
-                    if self.phase != .validating {
-                        self.beginValidation()
+                        isAuthenticating = false
+                        return
                     }
                 }
             }
         }
-    }
-
-    /// Navigate to a page that reliably requires a logged-in session.
-    /// If redirected to login/checkpoint/unsupported, validation fails and we keep WebView alive.
-    private func beginValidation() {
-        guard phase != .finished else { return }
-        guard pendingSecret != nil else { return }
-
-        // Avoid infinite loops.
-        if validationAttempts >= maxValidationAttempts {
-            phase = .authenticating
-            pendingSecret = nil
-            validationAttempts = 0
-            return
-        }
-
-        validationAttempts += 1
-        phase = .validating
-
-        // Strong validation target
-        guard let url = URL(string: "https://www.instagram.com/accounts/edit/") else { return }
-
-        let req = URLRequest(url: url,
-                             cachePolicy: .reloadIgnoringLocalCacheData,
-                             timeoutInterval: 30)
-        self.load(req)
-    }
-
-    private func handleValidationFinish(currentURL: URL?) {
-        guard phase == .validating else { return }
-
-        // If we landed on checkpoint/unsupported -> user must complete it; do not emit.
-        if isCheckpointOrUnsupportedPage(url: currentURL) {
-            phase = .authenticating
-            return
-        }
-
-        // If we got redirected back to login -> not validated.
-        if isLoginPage(url: currentURL) {
-            phase = .authenticating
-            return
-        }
-
-        // If we are still on instagram.com and not login/challenge -> treat as validated.
-        // Emit final secret.
-        if let finalSecret = pendingSecret {
-            subject.send(finalSecret)
-            subject.send(completion: .finished)
-            phase = .finished
-            stopPolling()
-        }
-    }
-
-    // MARK: - URL helpers
-
-    private func isLoginPage(url: URL?) -> Bool {
-        guard let s = url?.absoluteString.lowercased() else { return false }
-        if s.contains("/accounts/login") { return true }
-        if s.contains("login") && s.contains("accounts") { return true }
-        return false
-    }
-
-    private func isCheckpointOrUnsupportedPage(url: URL?) -> Bool {
-        guard let s = url?.absoluteString.lowercased() else { return false }
-
-        // Your logs show: https://i.instagram.com/web/unsupported_version/
-        if s.contains("i.instagram.com/web/unsupported_version") { return true }
-
-        // common challenge/checkpoint patterns
-        if s.contains("checkpoint") { return true }
-        if s.contains("challenge") { return true }
-        if s.contains("two_factor") { return true }
-        if s.contains("/accounts/suspended") { return true }
-
-        return false
     }
 }
 
@@ -314,17 +256,19 @@ private extension AuthenticatorWebView {
             WKWebsiteDataTypeDiskCache,
             WKWebsiteDataTypeMemoryCache
         ]
+
         dataStore.removeData(ofTypes: types, modifiedSince: Date(timeIntervalSince1970: 0)) { }
     }
 
+    /// A conservative Safari-like UA.
+    /// (We intentionally keep this "web" UA for WebView login.)
     static func mobileSafariUserAgent() -> String {
         let systemVersion = UIDevice.current.systemVersion
         let osForCPU = systemVersion.replacingOccurrences(of: ".", with: "_")
 
-        let versionComponents = systemVersion.split(separator: ".")
-        let major = versionComponents.first.map(String.init) ?? "16"
-        let minor = versionComponents.dropFirst().first.map(String.init) ?? "0"
-        let safariVersion = "\(major).\(minor)"
+        // Keep Version/<major>.0 format (Safari-like)
+        let major = systemVersion.split(separator: ".").first.map(String.init) ?? "16"
+        let safariVersion = "\(major).0"
 
         return "Mozilla/5.0 (iPhone; CPU iPhone OS \(osForCPU) like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/\(safariVersion) Mobile/15E148 Safari/604.1"
     }
